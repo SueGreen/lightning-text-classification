@@ -2,14 +2,17 @@
 Runs a model on a single node across N-gpus.
 """
 import argparse
-import os
+from argparse import Namespace
 from datetime import datetime
+from pathlib import Path
 
-from classifier import Classifier
+import yaml
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning.loggers import LightningLoggerBase, TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger
 from torchnlp.random import set_seed
+
+from classifier import Classifier
 
 
 def main(hparams) -> None:
@@ -22,7 +25,7 @@ def main(hparams) -> None:
     # 1 INIT LIGHTNING MODEL AND DATA
     # ------------------------
     model = Classifier(hparams)
-    
+
     # ------------------------
     # 2 INIT EARLY STOPPING
     # ------------------------
@@ -30,7 +33,7 @@ def main(hparams) -> None:
         monitor=hparams.monitor,
         min_delta=0.0,
         patience=hparams.patience,
-        verbose=True,
+        verbose=False,
         mode=hparams.metric_mode,
     )
 
@@ -39,25 +42,24 @@ def main(hparams) -> None:
     # ------------------------
     # Tensorboard Callback
     tb_logger = TensorBoardLogger(
-        save_dir="experiments/",
-        version="version_" + datetime.now().strftime("%d-%m-%Y--%H-%M-%S"),
+        save_dir=hparams.save_dir,
+        version="version_" + datetime.now().strftime("%d-%n-%Y--%H-%M-%S"),
         name="",
+        default_hp_metric=True
     )
 
     # Model Checkpoint Callback
-    ckpt_path = os.path.join(
-        "experiments/", tb_logger.version, "checkpoints",
-    )
+    ckpt_path = Path(hparams.save_dir) / str(tb_logger.version) / "checkpoints"
 
     # --------------------------------
     # 4 INIT MODEL CHECKPOINT CALLBACK
     # -------------------------------
-    checkpoint_callback = ModelCheckpoint(
-        filepath=ckpt_path,
+    best_metric_checkpoint_callback = ModelCheckpoint(
+        dirpath=ckpt_path,
         save_top_k=hparams.save_top_k,
         verbose=True,
         monitor=hparams.monitor,
-        period=1,
+        every_n_epochs=1,
         mode=hparams.metric_mode,
         save_weights_only=True
     )
@@ -68,18 +70,22 @@ def main(hparams) -> None:
     trainer = Trainer(
         logger=tb_logger,
         checkpoint_callback=True,
-        early_stop_callback=early_stop_callback,
+        callbacks=[best_metric_checkpoint_callback, early_stop_callback],
         gradient_clip_val=1.0,
         gpus=hparams.gpus,
         log_gpu_memory="all",
         deterministic=True,
-        check_val_every_n_epoch=1,
-        fast_dev_run=False,
+        check_val_every_n_epoch=hparams.check_val_every_n_epoch,
+        log_every_n_steps=hparams.log_every_n_steps,
         accumulate_grad_batches=hparams.accumulate_grad_batches,
         max_epochs=hparams.max_epochs,
         min_epochs=hparams.min_epochs,
+        max_time=hparams.max_time,
         val_check_interval=hparams.val_check_interval,
-        distributed_backend="dp",
+        limit_train_batches=hparams.limit_train_batches,
+        limit_val_batches=hparams.limit_val_batches,
+        limit_test_batches=hparams.limit_test_batches,
+        # distributed_backend="dp",
     )
     # ------------------------
     # 6 START TRAINING
@@ -96,75 +102,16 @@ if __name__ == "__main__":
         description="Minimalist Transformer Classifier",
         add_help=True,
     )
-    parser.add_argument("--seed", type=int, default=3, help="Training seed.")
-    parser.add_argument(
-        "--save_top_k",
-        default=1,
-        type=int,
-        help="The best k models according to the quantity monitored will be saved.",
-    )
-    # Early Stopping
-    parser.add_argument(
-        "--monitor", default="val_acc", type=str, help="Quantity to monitor."
-    )
-    parser.add_argument(
-        "--metric_mode",
-        default="max",
-        type=str,
-        help="If we want to min/max the monitored quantity.",
-        choices=["auto", "min", "max"],
-    )
-    parser.add_argument(
-        "--patience",
-        default=3,
-        type=int,
-        help=(
-            "Number of epochs with no improvement "
-            "after which training will be stopped."
-        ),
-    )
-    parser.add_argument(
-        "--min_epochs",
-        default=1,
-        type=int,
-        help="Limits training to a minimum number of epochs",
-    )
-    parser.add_argument(
-        "--max_epochs",
-        default=20,
-        type=int,
-        help="Limits training to a max number number of epochs",
-    )
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to a config.yaml file")
+    config_path = parser.parse_args().config
 
-    # Batching
-    parser.add_argument(
-        "--batch_size", default=6, type=int, help="Batch size to be used."
-    )
-    parser.add_argument(
-        "--accumulate_grad_batches",
-        default=2,
-        type=int,
-        help=(
-            "Accumulated gradients runs K small batches of size N before "
-            "doing a backwards pass."
-        ),
-    )
+    with open(config_path, "r") as stream:
+        try:
+            hparams = yaml.safe_load(stream)
+        except yaml.YAMLError as exc:
+            print(exc)
 
-    # gpu args
-    parser.add_argument("--gpus", type=int, default=1, help="How many gpus")
-    parser.add_argument(
-        "--val_check_interval",
-        default=1.0,
-        type=float,
-        help=(
-            "If you don't want to use the entire dev set (for debugging or "
-            "if it's huge), set how much of the dev set you want to use with this flag."
-        ),
-    )
-
-    # each LightningModule defines arguments relevant to it
-    parser = Classifier.add_model_specific_args(parser)
-    hparams = parser.parse_args()
+    hparams = Namespace(**hparams)
 
     # ---------------------
     # RUN TRAINING

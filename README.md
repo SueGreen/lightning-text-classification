@@ -99,5 +99,3 @@ Launch tensorboard with:
 tensorboard --logdir="experiments/"
 ```
 
-### Code Style:
-To make sure all the code follows the same style we use [Black](https://github.com/psf/black).

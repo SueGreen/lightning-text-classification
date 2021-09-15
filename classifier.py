@@ -1,41 +1,43 @@
 # -*- coding: utf-8 -*-
 import logging as log
-from argparse import ArgumentParser, Namespace
+from argparse import Namespace
 from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
+import pytorch_lightning as pl
+import tensorboard as tb
+import tensorflow as tf
 import torch
 import torch.nn as nn
 from torch import optim
 from torch.utils.data import DataLoader, RandomSampler
-from transformers import AutoModel
-
-import pytorch_lightning as pl
-from tokenizer import Tokenizer
 from torchnlp.encoders import LabelEncoder
-from torchnlp.utils import collate_tensors, lengths_to_mask
-from utils import mask_fill
+from torchnlp.utils import collate_tensors
+from transformers import AutoModel, AutoTokenizer
+
+tf.io.gfile = tb.compat.tensorflow_stub.io.gfile  # https://github.com/pytorch/pytorch/issues/30966#issuecomment-582747929
 
 
 class Classifier(pl.LightningModule):
     """
-    Sample model to show how to use a Transformer model to classify sentences.
+    Sample model to use a Transformer model to classify sentences / phrases.
     
     :param hparams: ArgumentParser containing the hyperparameters.
     """
-    
+
     class DataModule(pl.LightningDataModule):
         def __init__(self, classifier_instance):
             super().__init__()
-            self.hparams = classifier_instance.hparams
             self.classifier = classifier_instance
             # Label Encoder
+            products_df = pd.read_csv(self.classifier.hparams.train_csv)
+            products_df.rename(columns={"product_title": "text", "category_id": "label"}, inplace=True)
             self.label_encoder = LabelEncoder(
-                pd.read_csv(self.hparams.train_csv).label.astype(str).unique().tolist(), 
+                products_df.label.astype(str).unique().tolist(),
                 reserved_labels=[]
             )
-            self.label_encoder.unknown_index = None
+            self.categories_df = pd.read_csv(self.classifier.hparams.categories_csv)
 
         def read_csv(self, path: str) -> list:
             """ Reads a comma separated value file.
@@ -45,6 +47,7 @@ class Classifier(pl.LightningModule):
             :return: List of records as dictionaries
             """
             df = pd.read_csv(path)
+            df.rename(columns={"product_title": "text", "category_id": "label"}, inplace=True)
             df = df[["text", "label"]]
             df["text"] = df["text"].astype(str)
             df["label"] = df["label"].astype(str)
@@ -52,43 +55,43 @@ class Classifier(pl.LightningModule):
 
         def train_dataloader(self) -> DataLoader:
             """ Function that loads the train set. """
-            self._train_dataset = self.read_csv(self.hparams.train_csv)
+            self._train_dataset = self.read_csv(self.classifier.hparams.train_csv)
             return DataLoader(
                 dataset=self._train_dataset,
                 sampler=RandomSampler(self._train_dataset),
-                batch_size=self.hparams.batch_size,
+                batch_size=self.classifier.hparams.batch_size,
                 collate_fn=self.classifier.prepare_sample,
-                num_workers=self.hparams.loader_workers,
+                num_workers=self.classifier.hparams.loader_workers,
             )
 
         def val_dataloader(self) -> DataLoader:
             """ Function that loads the validation set. """
-            self._dev_dataset = self.read_csv(self.hparams.dev_csv)
+            self._dev_dataset = self.read_csv(self.classifier.hparams.dev_csv)
             return DataLoader(
                 dataset=self._dev_dataset,
-                batch_size=self.hparams.batch_size,
+                batch_size=self.classifier.hparams.batch_size,
                 collate_fn=self.classifier.prepare_sample,
-                num_workers=self.hparams.loader_workers,
+                num_workers=self.classifier.hparams.loader_workers,
             )
 
         def test_dataloader(self) -> DataLoader:
             """ Function that loads the test set. """
-            self._test_dataset = self.read_csv(self.hparams.test_csv)
+            self._test_dataset = self.read_csv(self.classifier.hparams.test_csv)
             return DataLoader(
                 dataset=self._test_dataset,
-                batch_size=self.hparams.batch_size,
+                batch_size=self.classifier.hparams.batch_size,
                 collate_fn=self.classifier.prepare_sample,
-                num_workers=self.hparams.loader_workers,
+                num_workers=self.classifier.hparams.loader_workers,
             )
 
     def __init__(self, hparams: Namespace) -> None:
         super(Classifier, self).__init__()
-        self.hparams = hparams
+        self.save_hyperparameters(hparams)
         self.batch_size = hparams.batch_size
 
         # Build Data module
         self.data = self.DataModule(self)
-        
+
         # build model
         self.__build_model()
 
@@ -114,7 +117,7 @@ class Classifier(pl.LightningModule):
             self.encoder_features = 768
 
         # Tokenizer
-        self.tokenizer = Tokenizer("bert-base-uncased")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.hparams.encoder_model)
 
         # Classification head
         self.classification_head = nn.Sequential(
@@ -161,11 +164,14 @@ class Classifier(pl.LightningModule):
                 self.data.label_encoder.index_to_token[prediction]
                 for prediction in np.argmax(logits, axis=1)
             ]
-            sample["predicted_label"] = predicted_labels[0]
+            index = self.data.categories_df.category_id == int(predicted_labels[0])
+            predicted_label = self.data.categories_df[index].iloc[0]
+            sample["predicted_label"] = predicted_label["category_title"]
+            sample["predicted_label_path"] = predicted_label["category_path"]
 
         return sample
 
-    def forward(self, tokens, lengths):
+    def forward(self, input_ids, token_type_ids, attention_mask):
         """ Usual pytorch forward function.
         :param tokens: text sequences [batch_size x src_seq_len]
         :param lengths: source lengths [batch_size]
@@ -173,24 +179,16 @@ class Classifier(pl.LightningModule):
         Returns:
             Dictionary with model outputs (e.g: logits)
         """
-        tokens = tokens[:, : lengths.max()]
-        # When using just one GPU this should not change behavior
-        # but when splitting batches across GPU the tokens have padding
-        # from the entire original batch
-        mask = lengths_to_mask(lengths, device=tokens.device)
+        tokens = input_ids
+        mask = attention_mask
 
         # Run BERT model.
-        word_embeddings = self.bert(tokens, mask)[0]
-
-        # Average Pooling
-        word_embeddings = mask_fill(
-            0.0, tokens, word_embeddings, self.tokenizer.padding_index
-        )
-        sentemb = torch.sum(word_embeddings, 1)
+        word_embeddings = self.bert(tokens, token_type_ids, mask)[0]
+        sentence_embeddings = torch.sum(word_embeddings, 1)
         sum_mask = mask.unsqueeze(-1).expand(word_embeddings.size()).float().sum(1)
-        sentemb = sentemb / sum_mask
+        sentence_embeddings = sentence_embeddings / sum_mask
 
-        return {"logits": self.classification_head(sentemb)}
+        return {"sentence_embeddings": sentence_embeddings, "logits": self.classification_head(sentence_embeddings)}
 
     def loss(self, predictions: dict, targets: dict) -> torch.tensor:
         """
@@ -214,9 +212,7 @@ class Classifier(pl.LightningModule):
             - dictionary with the expected target labels.
         """
         sample = collate_tensors(sample)
-        tokens, lengths = self.tokenizer.batch_encode(sample["text"])
-
-        inputs = {"tokens": tokens, "lengths": lengths}
+        inputs = self.tokenizer(sample["text"], padding=True, truncation=True, return_tensors="pt", verbose=False)
 
         if not prepare_target:
             return inputs, {}
@@ -241,19 +237,9 @@ class Classifier(pl.LightningModule):
         """
         inputs, targets = batch
         model_out = self.forward(**inputs)
-        loss_val = self.loss(model_out, targets)
-
-        # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
-        if self.trainer.use_dp or self.trainer.use_ddp2:
-            loss_val = loss_val.unsqueeze(0)
-
-        tqdm_dict = {"train_loss": loss_val}
-        output = OrderedDict(
-            {"loss": loss_val, "progress_bar": tqdm_dict, "log": tqdm_dict}
-        )
-
-        # can also return just a scalar instead of a dict (return loss_val)
-        return output
+        loss = self.loss(model_out, targets)
+        self.log("achieved/loss/train", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        return loss
 
     def validation_step(self, batch: tuple, batch_nb: int, *args, **kwargs) -> dict:
         """ Similar to the training step but with the model in eval mode.
@@ -263,35 +249,31 @@ class Classifier(pl.LightningModule):
         """
         inputs, targets = batch
         model_out = self.forward(**inputs)
-        loss_val = self.loss(model_out, targets)
+        loss = self.loss(model_out, targets)
 
         y = targets["labels"]
         y_hat = model_out["logits"]
 
-        # acc
+        # accuracy
         labels_hat = torch.argmax(y_hat, dim=1)
         val_acc = torch.sum(y == labels_hat).item() / (len(y) * 1.0)
         val_acc = torch.tensor(val_acc)
 
         if self.on_gpu:
-            val_acc = val_acc.cuda(loss_val.device.index)
+            val_acc = val_acc.cuda(loss.device.index)
 
-        # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
-        if self.trainer.use_dp or self.trainer.use_ddp2:
-            loss_val = loss_val.unsqueeze(0)
-            val_acc = val_acc.unsqueeze(0)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_acc", val_acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
-        output = OrderedDict({"val_loss": loss_val, "val_acc": val_acc,})
-
-        # can also return just a scalar instead of a dict (return loss_val)
+        output = OrderedDict({"val_loss": loss, "val_acc": val_acc, })
         return output
 
     def validation_end(self, outputs: list) -> dict:
         """ Function that takes as input a list of dictionaries returned by the validation_step
         function and measures the model performance accross the entire validation set.
-        
+
         Returns:
-            - Dictionary with metrics to be added to the lightning logger.  
+            - Dictionary with metrics to be added to the lightning logger.
         """
         val_loss_mean = 0
         val_acc_mean = 0
@@ -326,74 +308,13 @@ class Classifier(pl.LightningModule):
             {"params": self.classification_head.parameters()},
             {
                 "params": self.bert.parameters(),
-                "lr": self.hparams.encoder_learning_rate,
+                "lr": float(self.hparams.encoder_learning_rate),
             },
         ]
-        optimizer = optim.Adam(parameters, lr=self.hparams.learning_rate)
+        optimizer = optim.Adam(parameters, lr=float(self.hparams.learning_rate))
         return [optimizer], []
 
-    def on_epoch_end(self):
+    def on_train_epoch_end(self, unused=None):
         """ Pytorch lightning hook """
         if self.current_epoch + 1 >= self.nr_frozen_epochs:
             self.unfreeze_encoder()
-    
-    @classmethod
-    def add_model_specific_args(
-        cls, parser: ArgumentParser
-    ) -> ArgumentParser:
-        """ Parser for Estimator specific arguments/hyperparameters. 
-        :param parser: argparse.ArgumentParser
-
-        Returns:
-            - updated parser
-        """
-        parser.add_argument(
-            "--encoder_model",
-            default="bert-base-uncased",
-            type=str,
-            help="Encoder model to be used.",
-        )
-        parser.add_argument(
-            "--encoder_learning_rate",
-            default=1e-05,
-            type=float,
-            help="Encoder specific learning rate.",
-        )
-        parser.add_argument(
-            "--learning_rate",
-            default=3e-05,
-            type=float,
-            help="Classification head learning rate.",
-        )
-        parser.add_argument(
-            "--nr_frozen_epochs",
-            default=1,
-            type=int,
-            help="Number of epochs we want to keep the encoder model frozen.",
-        )
-        parser.add_argument(
-            "--train_csv",
-            default="data/imdb_reviews_train.csv",
-            type=str,
-            help="Path to the file containing the train data.",
-        )
-        parser.add_argument(
-            "--dev_csv",
-            default="data/imdb_reviews_test.csv",
-            type=str,
-            help="Path to the file containing the dev data.",
-        )
-        parser.add_argument(
-            "--test_csv",
-            default="data/imdb_reviews_test.csv",
-            type=str,
-            help="Path to the file containing the dev data.",
-        )
-        parser.add_argument(
-            "--loader_workers",
-            default=8,
-            type=int,
-            help="How many subprocesses to use for data loading. 0 means that \
-                the data will be loaded in the main process.",
-        )
-        return parser
