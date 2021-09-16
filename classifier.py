@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, RandomSampler
 from torchnlp.encoders import LabelEncoder
 from torchnlp.utils import collate_tensors
 from transformers import AutoModel, AutoTokenizer
+from torchmetrics import Accuracy
 
 tf.io.gfile = tb.compat.tensorflow_stub.io.gfile  # https://github.com/pytorch/pytorch/issues/30966#issuecomment-582747929
 
@@ -31,7 +32,7 @@ class Classifier(pl.LightningModule):
             super().__init__()
             self.classifier = classifier_instance
             # Label Encoder
-            products_df = pd.read_csv(self.classifier.hparams.train_csv)
+            products_df = pd.read_csv(self.classifier.hparams.products_csv)
             products_df.rename(columns={"product_title": "text", "category_id": "label"}, inplace=True)
             self.label_encoder = LabelEncoder(
                 products_df.label.astype(str).unique().tolist(),
@@ -95,8 +96,9 @@ class Classifier(pl.LightningModule):
         # build model
         self.__build_model()
 
-        # Loss criterion initialization.
+        # Loss criterion and main metric initialization.
         self.__build_loss()
+        self.__build_metrics()
 
         if hparams.nr_frozen_epochs > 0:
             self.freeze_encoder()
@@ -131,6 +133,10 @@ class Classifier(pl.LightningModule):
     def __build_loss(self):
         """ Initializes the loss function/s. """
         self._loss = nn.CrossEntropyLoss()
+
+    def __build_metrics(self):
+        """ Initializes the loss function/s. """
+        self._metric = Accuracy()
 
     def unfreeze_encoder(self) -> None:
         """ un-freezes the encoder layer. """
@@ -202,6 +208,10 @@ class Classifier(pl.LightningModule):
         """
         return self._loss(predictions["logits"], targets["labels"])
 
+    def metric(self, model_out: dict, targets: dict) -> torch.tensor:
+        predictions = torch.argmax(model_out["logits"], dim=1)
+        return self._metric(predictions, targets["labels"])
+
     def prepare_sample(self, sample: list, prepare_target: bool = True) -> (dict, dict):
         """
         Function that prepares a sample to input the model.
@@ -224,9 +234,19 @@ class Classifier(pl.LightningModule):
         except RuntimeError:
             raise Exception("Label encoder found an unknown label.")
 
-    def training_step(self, batch: tuple, batch_nb: int, *args, **kwargs) -> dict:
+    def step(self, batch: tuple, training_phase: str):
+        inputs, targets = batch
+        model_out = self.forward(**inputs)
+        loss = self.loss(model_out, targets)
+        self.log(f"a/loss/{training_phase}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        metric = self.metric(model_out, targets)
+        self.log(f"a/acc/{training_phase}", metric, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        result = dict({"loss": loss, "metric": metric})
+        return result
+
+    def training_step(self, batch: tuple, batch_nb: int, *args, **kwargs):
         """ 
-        Runs one training step. This usually consists in the forward function followed
+        Runs on training step. This usually consists in the forward function followed
             by the loss function.
         
         :param batch: The output of your dataloader. 
@@ -235,72 +255,33 @@ class Classifier(pl.LightningModule):
         Returns:
             - dictionary containing the loss and the metrics to be added to the lightning logger.
         """
-        inputs, targets = batch
-        model_out = self.forward(**inputs)
-        loss = self.loss(model_out, targets)
-        self.log("achieved/loss/train", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        return loss
+        return self.step(batch, training_phase="train")
 
-    def validation_step(self, batch: tuple, batch_nb: int, *args, **kwargs) -> dict:
-        """ Similar to the training step but with the model in eval mode.
+    def validation_step(self, batch: tuple, batch_nb: int, *args, **kwargs):
+        """
+        Runs on validation step. This usually consists in the forward function followed
+            by the loss function.
+
+        :param batch: The output of the validation dataloader.
+        :param batch_nb: Integer displaying which batch this is
 
         Returns:
-            - dictionary passed to the validation_end function.
+            - dictionary containing the loss and the metrics to be added to the lightning logger.
         """
-        inputs, targets = batch
-        model_out = self.forward(**inputs)
-        loss = self.loss(model_out, targets)
+        return self.step(batch, training_phase="val")
 
-        y = targets["labels"]
-        y_hat = model_out["logits"]
-
-        # accuracy
-        labels_hat = torch.argmax(y_hat, dim=1)
-        val_acc = torch.sum(y == labels_hat).item() / (len(y) * 1.0)
-        val_acc = torch.tensor(val_acc)
-
-        if self.on_gpu:
-            val_acc = val_acc.cuda(loss.device.index)
-
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        self.log("val_acc", val_acc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
-        output = OrderedDict({"val_loss": loss, "val_acc": val_acc, })
-        return output
-
-    def validation_end(self, outputs: list) -> dict:
-        """ Function that takes as input a list of dictionaries returned by the validation_step
-        function and measures the model performance accross the entire validation set.
-
-        Returns:
-            - Dictionary with metrics to be added to the lightning logger.
+    def test_step(self, batch: tuple, batch_nb: int, *args, **kwargs):
         """
-        val_loss_mean = 0
-        val_acc_mean = 0
-        for output in outputs:
-            val_loss = output["val_loss"]
+            Runs on testing step. This usually consists in the forward function followed
+                by the loss function.
 
-            # reduce manually when using dp
-            if self.trainer.use_dp or self.trainer.use_ddp2:
-                val_loss = torch.mean(val_loss)
-            val_loss_mean += val_loss
+            :param batch: The output of the validation dataloader.
+            :param batch_nb: Integer displaying which batch this is
 
-            # reduce manually when using dp
-            val_acc = output["val_acc"]
-            if self.trainer.use_dp or self.trainer.use_ddp2:
-                val_acc = torch.mean(val_acc)
-
-            val_acc_mean += val_acc
-
-        val_loss_mean /= len(outputs)
-        val_acc_mean /= len(outputs)
-        tqdm_dict = {"val_loss": val_loss_mean, "val_acc": val_acc_mean}
-        result = {
-            "progress_bar": tqdm_dict,
-            "log": tqdm_dict,
-            "val_loss": val_loss_mean,
-        }
-        return result
+            Returns:
+                - dictionary containing the loss and the metrics to be added to the lightning logger.
+            """
+        return self.step(batch, training_phase="test")
 
     def configure_optimizers(self):
         """ Sets different Learning rates for different parameter groups. """

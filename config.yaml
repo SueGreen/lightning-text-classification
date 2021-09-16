@@ -1,28 +1,27 @@
-train_csv: 'data/tiny_chunk/products_tiny_train.csv'
-dev_csv: 'data/tiny_chunk/products_tiny_val.csv'
-test_csv: 'data/tiny_chunk/products_tiny_test.csv'
-categories_csv: 'data/tiny_chunk/tmp_categories.csv'
-limit_train_batches: 1.0
-limit_val_batches: 1.0
-limit_test_batches: 1.0
+train_csv: 'data/train.csv'
+dev_csv: 'data/val.csv'
+test_csv: 'data/test.csv'
+products_csv: 'data/products.csv'
+categories_csv: 'data/categories.csv'
+limit_train_batches: 0.001
+limit_val_batches: 0.001
+limit_test_batches: 0.0
+max_epochs: 2
+log_every_n_steps: 5
+check_val_every_n_epoch: 1
+batch_size: 4
 
 encoder_model: 'DeepPavlov/rubert-base-cased'
 seed: 3
 save_top_k: 1
-monitor: 'train_acc'
+monitor: 'achieved/acc/val'
 metric_mode: 'max'
-patience: 100
+patience: 50
 min_epochs: 1
-
-max_epochs: 80
-nr_frozen_epochs: 100
+nr_frozen_epochs: 1000
 num_finetuning_epochs_per_layer: 5
-
-batch_size: 6
 gpus: 1
-max_time: '00:02:00:00'
-check_val_every_n_epoch: 10
-log_every_n_steps: 5
+max_time: '00:05:00:00'
 accumulate_grad_batches: 2
 val_check_interval: 1.0
 encoder_learning_rate: 1e-05

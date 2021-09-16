@@ -3,7 +3,7 @@ Runs a script to interact with a model using the shell.
 """
 import os
 from argparse import ArgumentParser, Namespace
-
+from pathlib import Path
 import pandas as pd
 import yaml
 
@@ -16,7 +16,7 @@ def load_model_from_experiment(experiment_folder: str):
     Return:
         - Pretrained model.
     """
-    hparams_file = experiment_folder + "/hparams.yaml"
+    hparams_file = Path(experiment_folder) / "hparams.yaml"
     hparams = yaml.load(open(hparams_file).read(), Loader=yaml.FullLoader)
 
     checkpoints = [

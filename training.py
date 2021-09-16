@@ -43,7 +43,7 @@ def main(hparams) -> None:
     # Tensorboard Callback
     tb_logger = TensorBoardLogger(
         save_dir=hparams.save_dir,
-        version="version_" + datetime.now().strftime("%d-%n-%Y--%H-%M-%S"),
+        version="version_" + (str(datetime.now().strftime("%d-%n-%Y--%H-%M-%S"))).strip(),
         name="",
         default_hp_metric=True
     )
@@ -91,6 +91,7 @@ def main(hparams) -> None:
     # 6 START TRAINING
     # ------------------------
     trainer.fit(model, model.data)
+    trainer.test(model, model.data)
 
 
 if __name__ == "__main__":
