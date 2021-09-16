@@ -5,7 +5,7 @@ products_csv: 'data/products.csv'
 categories_csv: 'data/categories.csv'
 limit_train_batches: 0.001
 limit_val_batches: 0.001
-limit_test_batches: 0.0
+limit_test_batches: 0.001
 max_epochs: 2
 log_every_n_steps: 5
 check_val_every_n_epoch: 1
@@ -14,7 +14,7 @@ batch_size: 4
 encoder_model: 'DeepPavlov/rubert-base-cased'
 seed: 3
 save_top_k: 1
-monitor: 'achieved/acc/val'
+monitor: 'a/acc/val'
 metric_mode: 'max'
 patience: 50
 min_epochs: 1

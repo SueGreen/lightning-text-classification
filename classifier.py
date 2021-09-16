@@ -234,13 +234,13 @@ class Classifier(pl.LightningModule):
         except RuntimeError:
             raise Exception("Label encoder found an unknown label.")
 
-    def step(self, batch: tuple, training_phase: str):
+    def step(self, batch: tuple, training_phase: str, prog_bar=False):
         inputs, targets = batch
         model_out = self.forward(**inputs)
         loss = self.loss(model_out, targets)
-        self.log(f"a/loss/{training_phase}", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"a/loss/{training_phase}", loss, on_step=False, on_epoch=True, prog_bar=prog_bar, logger=True)
         metric = self.metric(model_out, targets)
-        self.log(f"a/acc/{training_phase}", metric, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(f"a/acc/{training_phase}", metric, on_step=False, on_epoch=True, prog_bar=prog_bar, logger=True)
         result = dict({"loss": loss, "metric": metric})
         return result
 
