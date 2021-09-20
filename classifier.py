@@ -100,11 +100,10 @@ class Classifier(pl.LightningModule):
         self.__build_loss()
         self.__build_metrics()
 
-        if hparams.nr_frozen_epochs > 0:
+        if hparams.n_frozen_epochs > 0:
             self.freeze_encoder()
         else:
             self._frozen = False
-        self.nr_frozen_epochs = hparams.nr_frozen_epochs
 
     def __build_model(self) -> None:
         """ Init BERT model + tokenizer + classification head."""
@@ -138,19 +137,33 @@ class Classifier(pl.LightningModule):
         """ Initializes the loss function/s. """
         self._metric = Accuracy()
 
+    def _unfreeze_encoder_layer(self):
+        self.n_unfreezed_layers += 1
+        for module_name in [list(self.bert.modules())[-self.n_unfreezed_layers]]:
+            if len(list(module_name.parameters())) > 0:
+                for param in module_name.parameters():
+                    param.requires_grad = True
+
     def unfreeze_encoder(self) -> None:
         """ un-freezes the encoder layer. """
         if self._frozen:
             log.info(f"\n-- Encoder model fine-tuning")
-            for param in self.bert.parameters():
-                param.requires_grad = True
+            self._unfreeze_encoder_layer()
             self._frozen = False
+        else:
+            # if number of epochs for one layer fine-tuning is reached
+            # and layer is allowed to be unfreezed, then unfreeze the next layer
+            if (self.current_epoch - self.hparams.n_frozen_epochs) % \
+                    self.hparams.n_epochs_per_layers_unfreezing == 0 and \
+                    self.n_unfreezed_layers < self.hparams.max_n_unfreezed_layers:
+                self._unfreeze_encoder_layer()
 
     def freeze_encoder(self) -> None:
         """ freezes the encoder layer. """
         for param in self.bert.parameters():
             param.requires_grad = False
         self._frozen = True
+        self.n_unfreezed_layers = 0
 
     def predict(self, sample: dict) -> dict:
         """ Predict function.
@@ -238,9 +251,9 @@ class Classifier(pl.LightningModule):
         inputs, targets = batch
         model_out = self.forward(**inputs)
         loss = self.loss(model_out, targets)
-        self.log(f"a/loss/{training_phase}", loss, on_step=False, on_epoch=True, prog_bar=prog_bar, logger=True)
+        self.log(f"a/loss/{training_phase}", loss, on_step=True, on_epoch=True, prog_bar=prog_bar, logger=True)
         metric = self.metric(model_out, targets)
-        self.log(f"a/acc/{training_phase}", metric, on_step=False, on_epoch=True, prog_bar=prog_bar, logger=True)
+        self.log(f"a/acc/{training_phase}", metric, on_step=True, on_epoch=True, prog_bar=prog_bar, logger=True)
         result = dict({"loss": loss, "metric": metric})
         return result
 
@@ -297,5 +310,5 @@ class Classifier(pl.LightningModule):
 
     def on_train_epoch_end(self, unused=None):
         """ Pytorch lightning hook """
-        if self.current_epoch + 1 >= self.nr_frozen_epochs:
+        if self.current_epoch + 1 >= self.hparams.n_frozen_epochs:
             self.unfreeze_encoder()
